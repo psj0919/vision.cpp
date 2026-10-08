@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
 #include <thread>
 #include <vector>
 
@@ -18,15 +19,23 @@ std::string_view to_string(backend_type type) {
         case backend_type::cpu: return "cpu";
         case backend_type::gpu: return "gpu";
         case backend_type::vulkan: return "vulkan";
+        case backend_type::gtx: return "gtx";
         default: return "unknown";
     }
 }
 
 bool load_ggml_backends() {
     static const bool loaded = []() {
-        if (ggml_backend_reg_count() > 0) {
-            return true; // already loaded
+        if (char const* module = std::getenv("GGML_BACKEND_PATH"); module && module[0]) {
+            if (!ggml_backend_load(module)) throw except("Failed to load backend library: {}", module);
+            printf("[VISP] loaded backend from %s\n", module);
         }
+#ifdef VISP_GTX_LIBRARY
+        // Keep legacy GTX as the default; load_all handles an explicit external module.
+        if (!std::getenv("GGML_BACKEND_PATH") && !ggml_backend_load(VISP_GTX_LIBRARY)) {
+            throw except("Failed to load GTX backend: {}", VISP_GTX_LIBRARY);
+        }
+#endif
         ggml_backend_load_all();
         if (ggml_backend_reg_count() == 0) {
             if (path dir = current_library_path(); !dir.empty()) {
@@ -49,6 +58,11 @@ bool backend_is_available(backend_type type) {
                 ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr;
         case backend_type::vulkan: {
             ggml_backend_reg_t reg = ggml_backend_reg_by_name("Vulkan");
+            return reg && ggml_backend_reg_dev_count(reg) > 0;
+        }
+        case backend_type::gtx: {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("GTXPY");
+            if (!reg) reg = ggml_backend_reg_by_name("GTX");
             return reg && ggml_backend_reg_dev_count(reg) > 0;
         }
         default: ASSERT(false, "Invalid backend type");
@@ -82,6 +96,9 @@ backend_device backend_init(backend_type type) {
                 b.handle.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr));
             }
             break;
+        case backend_type::gtx:
+            b.handle.reset(ggml_backend_init_by_name(ggml_backend_dev_by_name("GTXPY") ? "GTXPY" : "GTX0", nullptr));
+            break;
         default: ASSERT(false, "Invalid backend type");
     }
     if (!b.handle) {
@@ -103,6 +120,9 @@ backend_type backend_device::type() const {
             std::string_view dev_name = ggml_backend_dev_name(dev);
             if (dev_name.find("Vulkan") != std::string_view::npos) {
                 return backend_type::vulkan;
+            }
+            if (dev_name == "GTX0" || dev_name.starts_with("GTX")) {
+                return backend_type::gtx;
             }
             return backend_type::gpu;
         }
@@ -181,6 +201,7 @@ model_build_flags backend_default_flags(backend_type type) {
             return conv_2d_direct_cwhn | concat_n | window_partition | flash_attn_flag(false);
         case backend_type::gpu:
         case backend_type::vulkan: return flash_attn_flag(true);
+        case backend_type::gtx: return flash_attn_flag(false);
     }
     return {};
 }
@@ -528,6 +549,57 @@ ggml_type model_weights::float_type() const {
 //
 // compute_graph
 
+namespace {
+
+bool log_ops_enabled = false;
+size_t log_ops_graph_index = 0;
+
+void print_tensor_info(char const* role, ggml_tensor const* t) {
+    char const* name = ggml_get_name(t);
+    printf(
+        " %s=%s type=%s shape=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] cont=%d view=%d",
+        role, name && name[0] ? name : "<unnamed>", ggml_type_name(t->type),
+        (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+        t->nb[0], t->nb[1], t->nb[2], t->nb[3], ggml_is_contiguous(t), t->view_src != nullptr);
+}
+
+void log_graph_ops(ggml_cgraph* graph, backend_device const& backend) {
+    size_t graph_index = ++log_ops_graph_index;
+    int node_count = ggml_graph_n_nodes(graph);
+    char const* backend_name = ggml_backend_dev_name(backend.device);
+    std::map<std::string_view, int> counts;
+
+    printf("[VISP OPS] graph=%zu backend=%s nodes=%d\n", graph_index, backend_name, node_count);
+    for (int i = 0; i < node_count; ++i) {
+        ggml_tensor* node = ggml_graph_node(graph, i);
+        std::string_view op = ggml_op_desc(node);
+        ++counts[op];
+
+        printf("[VISP OPS] graph=%zu node=%d op=%s", graph_index, i, op.data());
+        print_tensor_info("dst", node);
+        for (int src = 0; src < GGML_MAX_SRC; ++src) {
+            if (node->src[src]) {
+                char role[8];
+                snprintf(role, sizeof(role), "src%d", src);
+                print_tensor_info(role, node->src[src]);
+            }
+        }
+        printf("\n");
+    }
+
+    printf("[VISP OPS] graph=%zu summary", graph_index);
+    for (auto const& [op, count] : counts) {
+        printf(" %.*s=%d", (int)op.size(), op.data(), count);
+    }
+    printf("\n");
+}
+
+} // namespace
+
+void set_log_ops(bool enabled) {
+    log_ops_enabled = enabled;
+}
+
 compute_graph compute_graph_init(size_t size) {
     ggml_init_params graph_ctx_params{};
     graph_ctx_params.mem_size = size * ggml_tensor_overhead() + ggml_graph_overhead();
@@ -558,7 +630,9 @@ bool compute_graph_allocate(compute_graph& g, backend_device const& backend) {
 }
 
 void compute(compute_graph const& g, backend_device const& b) {
-    ggml_backend_graph_compute(b, g.graph);
+    if (log_ops_enabled) log_graph_ops(g.graph, b);
+    auto status = ggml_backend_graph_compute(b, g.graph);
+    if (status != GGML_STATUS_SUCCESS) throw except("Graph compute failed: {}", ggml_status_to_string(status));
 }
 
 //

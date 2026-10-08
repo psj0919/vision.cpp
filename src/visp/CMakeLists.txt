@@ -1,6 +1,8 @@
 add_library(visioncpp)
 
 target_sources(visioncpp PRIVATE
+  arch/DetectionModel.cpp
+  arch/ResNet.cpp
   arch/birefnet.cpp
   arch/depth-anything.cpp
   arch/dino.cpp

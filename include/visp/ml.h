@@ -48,6 +48,7 @@ enum class backend_type {
     cpu = 1,
     gpu = 2,
     vulkan = gpu | 1 << 8,
+    gtx = gpu | 1 << 9,
 };
 
 constexpr bool operator&(backend_type a, backend_type b);
@@ -218,6 +219,7 @@ VISP_API bool compute_graph_allocate(compute_graph&, backend_device const&);
 
 // Runs inference. Blocks until done.
 VISP_API void compute(compute_graph const&, backend_device const&);
+VISP_API void set_log_ops(bool enabled);
 
 //
 // Model ref - represents a ML model
